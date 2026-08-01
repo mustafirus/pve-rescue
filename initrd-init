@@ -1,0 +1,81 @@
+#!/bin/sh
+export PATH=/bin:/sbin
+
+# Базові файлові системи
+mount -t proc     proc     /proc
+mount -t sysfs    sysfs    /sys
+mount -t devtmpfs devtmpfs /dev
+
+#mount -t tmpfs tmpfs /run
+mkdir -p /run/initramfs/squashfs
+mkdir -p /run/initramfs/overlay
+
+echo "pve-rescue: loading modules..."
+modprobe -q loop     2>/dev/null || true
+modprobe -q squashfs 2>/dev/null || true
+modprobe -q overlay  2>/dev/null || true
+
+# Шукаємо squashfs:
+# 1) в initramfs (iPXE: initrd pve-rescue.squashfs /pve-rescue.squashfs)
+# 2) на блокових пристроях (ISO/USB)
+SQFS=""
+for f in /pve-rescue.squashfs /root.squashfs; do
+    [ -f "$f" ] && SQFS="$f" && break
+done
+
+# Якщо не в initramfs — шукаємо на CD-ROM/USB
+if [ -z "$SQFS" ]; then
+    echo "pve-rescue: squashfs not in initramfs, scanning block devices..."
+    modprobe -q isofs    2>/dev/null || true
+    modprobe -q sr_mod   2>/dev/null || true
+    modprobe -q usb-storage 2>/dev/null || true
+    modprobe -q sd_mod   2>/dev/null || true
+    sleep 2  # чекаємо на udev/пристрої
+
+    mkdir -p /run/rescue/media
+    for dev in /dev/sr* /dev/sd*; do
+        [ -b "$dev" ] || continue
+        mount -o ro "$dev" /run/rescue/media 2>/dev/null || continue
+        if [ -f /run/rescue/media/pve-rescue.squashfs ]; then
+            SQFS="/run/rescue/media/pve-rescue.squashfs"
+            echo "pve-rescue: found squashfs on $dev"
+            break
+        fi
+        umount /run/rescue/media 2>/dev/null || true
+    done
+fi
+
+if [ -z "$SQFS" ]; then
+    echo "FATAL: squashfs not found!"
+    echo "  PXE:  initrd pve-rescue.squashfs /pve-rescue.squashfs"
+    echo "  ISO:  pve-rescue.squashfs must be on ISO root"
+    exec sh
+fi
+
+echo "pve-rescue: mounting $SQFS..."
+mount -t squashfs -o ro,loop "$SQFS" /run/initramfs/squashfs || {
+    echo "FATAL: cannot mount squashfs!"
+    exec sh
+}
+
+echo "pve-rescue: setting up overlayfs..."
+mount -t tmpfs -o size=80% tmpfs /run/initramfs/overlay
+mkdir -p /run/initramfs/overlay/upper /run/initramfs/overlay/work
+
+mount -t overlay overlay \
+    -o lowerdir=/run/initramfs/squashfs,upperdir=/run/initramfs/overlay/upper,workdir=/run/initramfs/overlay/work \
+    /newroot || {
+    echo "FATAL: cannot mount overlayfs!"
+    exec sh
+}
+
+# Переносимо монтування в новий root
+mkdir -p /newroot/run/initramfs/squashfs /newroot/run/initramfs/overlay
+mount --move /run/initramfs/squashfs /newroot/run/initramfs/squashfs
+mount --move /run/initramfs/overlay  /newroot/run/initramfs/overlay
+
+# Прибираємо
+umount /proc /sys /dev 2>/dev/null || true
+
+echo "pve-rescue: switching to rootfs..."
+exec switch_root /newroot /sbin/init

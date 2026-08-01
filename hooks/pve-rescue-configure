@@ -1,0 +1,63 @@
+#!/bin/bash
+set -euo pipefail
+
+# Виконується всередині chroot як root
+# Файли вже скопійовані через --copy-in
+sed -i '/download.proxmox.com/d' /etc/apt/sources.list
+# install.conf — файли та права
+while read -r file dir mode rest; do
+    [[ "$file" =~ ^# ]] && continue
+    [ -z "$file" ] && continue
+    mkdir -p "$dir"
+    install -m "$mode" "/rootfs_tools/$file" "$dir/$file"
+done < /install.conf
+
+# symlinks.conf — символічні посилання
+while read -r link target rest; do
+    [[ "$link" =~ ^# ]] && continue
+    [ -z "$link" ] && continue
+    mkdir -p "$(dirname "$link")"
+    ln -sf "$target" "$link"
+done < /symlinks.conf
+
+# Розлочити root (порожній пароль)
+#sed -i 's|^root:!:|root::|' /etc/shadow
+#sed -i 's|^root:\*:|root::|' /etc/shadow
+
+# Rename dotfiles (install.conf can't handle dot-prefixed names)
+[ -f /root/bashrc ] && mv /root/bashrc /root/.bashrc
+
+# SSH keys — збираємо всі *.pub з rootfs_tools/
+if ls /rootfs_tools/*.pub 1>/dev/null 2>&1; then
+    mkdir -p /root/.ssh
+    cat /rootfs_tools/*.pub > /root/.ssh/authorized_keys
+    chmod 700 /root/.ssh
+    chmod 600 /root/.ssh/authorized_keys
+fi
+
+# Locales: en_US.UTF-8 (default), uk_UA.UTF-8
+sed -i 's/^# *en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen
+sed -i 's/^# *uk_UA.UTF-8/uk_UA.UTF-8/' /etc/locale.gen
+locale-gen
+update-locale LANG=en_US.UTF-8
+
+# Hostname
+echo "pve-rescue" > /etc/hostname
+KVER=$(ls /lib/modules | sort -V | tail -1)
+cd /boot; mv vmlinuz-$KVER pve-rescue.kernel
+
+# initrd modules — select needed, stage for copy-out
+mkdir -p /tmp/initrd_mods
+for mod in squashfs overlay loop isofs sr_mod cdrom usb-storage sd_mod; do
+    f=$(find /lib/modules/$KVER -name "${mod}.ko*" 2>/dev/null | head -1)
+    [ -n "$f" ] && cp --parents "$f" /tmp/initrd_mods
+done
+for f in modules.dep modules.dep.bin modules.alias modules.alias.bin; do
+    cp /lib/modules/$KVER/$f /tmp/initrd_mods/lib/modules/$KVER/ 2>/dev/null || true
+done
+
+# Видалити непотрібні редактори (Priority:important, тягнуться з --variant)
+apt-get remove --purge -y nano vim-tiny vim-common 2>/dev/null || true
+
+# Прибираємо тимчасові файли
+rm -rf /rootfs_tools /install.conf /symlinks.conf /pve-rescue-configure

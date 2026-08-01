@@ -1,0 +1,4 @@
+# PVE Rescue .bashrc
+
+# Run-once initialization (SSH setup)
+source /usr/local/bin/rescue-init.sh

@@ -1,0 +1,121 @@
+#!/bin/bash
+set -euo pipefail
+
+WORKDIR="$(pwd)/pve_rescue_build"
+OUT_DIR="$(pwd)/pve_output"
+INITRD_TREE="$WORKDIR/initrd_tree"
+ISO_DIR="$WORKDIR/iso"
+PVE_REL="trixie"
+cd $(dirname $(readlink -f $0))
+
+# Перевірка залежностей хоста
+REQUIRED_PKGS=(mmdebstrap squashfs-tools xorriso mtools grub-common grub-pc-bin grub-efi-amd64-bin wget cpio zstd)
+MISSING=()
+for pkg in "${REQUIRED_PKGS[@]}"; do
+    dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed" || MISSING+=("$pkg")
+done
+if [ ${#MISSING[@]} -gt 0 ]; then
+    echo "Відсутні пакунки: ${MISSING[*]}"
+    echo "Встановіть їх:"
+    echo "  sudo apt update && sudo apt install -y ${MISSING[*]}"
+    exit 1
+fi
+
+#Очищення попереднього запуску
+rm -rf "$OUT_DIR" "$WORKDIR"
+mkdir -p "$INITRD_TREE" "$ISO_DIR/boot/grub" "$OUT_DIR"
+
+# 1. Збірка RootFS (без dracut — він не потрібен у rescue-образі)
+PROXMOX_KEY="rootfs_tools/proxmox-archive-keyring.gpg"
+[[ -f $PROXMOX_KEY ]] || wget -q "https://enterprise.proxmox.com/debian/proxmox-archive-keyring-trixie.gpg" -O "$PROXMOX_KEY"
+
+mmdebstrap \
+    --variant=important \
+    --customize-hook=./hooks/pve-rescue-prune \
+    --customize-hook='copy-in rootfs_tools install.conf symlinks.conf hooks/pve-rescue-configure /' \
+    --customize-hook='chroot "$1" bash /pve-rescue-configure' \
+    --customize-hook="copy-out /boot/pve-rescue.kernel $OUT_DIR" \
+    --customize-hook="copy-out /tmp/initrd_mods/lib $INITRD_TREE" \
+    --include=proxmox-default-kernel,zfsutils-linux,lvm2,bash,mc,less,host,lshw,pciutils,\
+iproute2,ssh,coreutils,util-linux,kmod,udev,mmdebstrap,arch-install-scripts,ca-certificates,\
+debootstrap,wget,partclone,pv,htop,tmux,rsync,gdisk,btrfs-progs,systemd-resolved,locales,smartmontools \
+    --aptopt='Apt::Install-Recommends "false";' \
+    --keyring="$PROXMOX_KEY" \
+    "$PVE_REL" $WORKDIR/pve-rescue.tar \
+    "deb http://deb.debian.org/debian $PVE_REL main contrib" \
+    "deb http://download.proxmox.com/debian/pve $PVE_REL pve-no-subscription"
+
+mksquashfs - $OUT_DIR/pve-rescue.squashfs -tar -comp zstd \
+    -e boot -e proc -e sys -e dev -e run -e tmp < $WORKDIR/pve-rescue.tar
+
+# 2. Визначення версії ядра
+KVER=$(ls "$INITRD_TREE/lib/modules" | sort -V | tail -n1)
+
+# ========================================
+# 4. Збірка initrd РУКАМИ (без dracut)
+# ========================================
+echo "Building initrd..."
+
+# Структура initrd
+mkdir -p "$INITRD_TREE"/{bin,sbin,lib,proc,sys,dev,run,tmp,newroot}
+
+# 4а. Busybox — завантажуємо без інсталяції (статично злінкований, версія не важлива)
+(cd "$WORKDIR" && apt download busybox-static)
+dpkg-deb -x "$WORKDIR"/busybox-static_*.deb "$WORKDIR/busybox-extract"
+cp "$WORKDIR/busybox-extract/bin/busybox" "$INITRD_TREE/bin/busybox"
+rm -rf "$WORKDIR"/busybox-static_*.deb "$WORKDIR/busybox-extract"
+# Симлінки для потрібних команд
+for cmd in sh mount umount mkdir ln echo cat sleep switch_root \
+           modprobe insmod mknod grep; do
+    ln -sf busybox "$INITRD_TREE/bin/$cmd"
+done
+
+# 4г. init скрипт
+install -m 755 initrd-init "$INITRD_TREE/init"
+
+# 4д. Пакуємо initrd (cpio + zstd — initrd маленький, squashfs окремо)
+echo "Packing initrd..."
+(cd "$INITRD_TREE" && find . | cpio -o -H newc --quiet) | zstd -19 -T0 > "$OUT_DIR/pve-rescue.initrd"
+
+echo "Initrd size: $(du -sh "$OUT_DIR/pve-rescue.initrd" | cut -f1)"
+
+# 5. ISO структура
+cp "$OUT_DIR/pve-rescue.kernel" "$ISO_DIR/vmlinuz"
+cp "$OUT_DIR/pve-rescue.initrd" "$ISO_DIR/initrd"
+ln "$OUT_DIR/pve-rescue.squashfs" "$ISO_DIR/pve-rescue.squashfs"
+
+cat <<EOF > "$ISO_DIR/boot/grub/grub.cfg"
+set timeout=5
+set default=0
+
+menuentry "Proxmox Rescue" {
+    linux /vmlinuz ro quiet
+    initrd /initrd
+}
+
+menuentry "Proxmox Rescue (verbose)" {
+    linux /vmlinuz ro
+    initrd /initrd
+}
+EOF
+
+# 6. Hybrid ISO
+grub-mkrescue \
+  --modules="part_gpt part_msdos iso9660 all_video" \
+  -o "$OUT_DIR/pve-rescue.iso" "$ISO_DIR" \
+  -- -volid "PVE_RESCUE"
+
+echo ""
+echo "✅ Готово!"
+echo "  Kernel:   $OUT_DIR/pve-rescue.kernel"
+echo "  Initrd:   $OUT_DIR/pve-rescue.initrd"
+echo "  SquashFS: $OUT_DIR/pve-rescue.squashfs"
+echo "  ISO:      $OUT_DIR/pve-rescue.iso"
+echo ""
+echo "PXE boot (iPXE):"
+echo "  kernel http://\${srv_ip}/pve-rescue.kernel ro"
+echo "  initrd http://\${srv_ip}/pve-rescue.initrd"
+echo "  initrd http://\${srv_ip}/pve-rescue.squashfs /pve-rescue.squashfs"
+echo "  boot"
+echo ""
+du -sh "$OUT_DIR"/*

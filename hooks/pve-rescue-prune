@@ -1,0 +1,175 @@
+#!/bin/bash
+set -euo pipefail
+
+# mmdebstrap --customize-hook: $1 = chroot path
+CHROOT="$1"
+KVER=$(ls "$CHROOT/lib/modules" | sort -V | tail -n1)
+KMOD_DIR="$CHROOT/lib/modules/$KVER/kernel"
+
+# 2а. Видалення непотрібних модулів ядра
+echo "Pruning kernel modules..."
+REMOVE_DIRS=(
+    # Звук — повністю
+    "sound"
+
+    # Сенсори/датчики — embedded сміття
+    "drivers/iio"
+    "drivers/comedi"
+
+    # Медіа — ТВ-тюнери, вебкамери, DVB
+    "drivers/media"
+
+    # Бездротове — не потрібно на сервері
+    "drivers/bluetooth"
+    "drivers/net/wireless"
+    "drivers/net/ieee802154"
+    "drivers/net/can"
+    "drivers/net/wwan"
+    "drivers/net/wan"
+    "drivers/net/arcnet"
+    "drivers/net/hamradio"
+    "drivers/net/fddi"
+    "drivers/net/slip"
+    "drivers/net/plip"
+    "drivers/net/caif"
+    "drivers/net/dsa"
+    "drivers/net/netdevsim"
+
+    # Ethernet — музейні/embedded
+    "drivers/net/ethernet/dec"
+    "drivers/net/ethernet/3com"
+    "drivers/net/ethernet/8390"
+    "drivers/net/ethernet/smsc"
+    "drivers/net/ethernet/sun"
+    "drivers/net/ethernet/stmicro"
+    "drivers/net/ethernet/microchip"
+    "drivers/net/ethernet/micrel"
+    "drivers/net/ethernet/xilinx"
+    "drivers/net/ethernet/qualcomm"
+    "drivers/net/ethernet/brocade"
+
+    # net/ — мертві протоколи
+    "net/bluetooth"
+    "net/wireless"
+    "net/mac80211"
+    "net/ieee802154"
+    "net/decnet"
+    "net/appletalk"
+    "net/ax25"
+    "net/rose"
+    "net/x25"
+    "net/6lowpan"
+    "net/9p"
+    "net/atm"
+    "net/nfc"
+    "net/phonet"
+    "net/rds"
+    "net/caif"
+
+    # GPU — залишаємо тільки virtio/bochs для VM/IPMI
+    "drivers/gpu/drm/amd"
+    "drivers/gpu/drm/nouveau"
+    "drivers/gpu/drm/i915"
+    "drivers/gpu/drm/radeon"
+    "drivers/gpu/drm/ast"
+
+    # Input — периферія не потрібна
+    "drivers/input/joystick"
+    "drivers/input/tablet"
+    "drivers/input/touchscreen"
+
+    # Телефонія/ISDN
+    "drivers/isdn"
+    "drivers/telephony"
+
+    # Staging — експериментальне сміття
+    "drivers/staging"
+
+    # Екзотичне залізо
+    "drivers/nfc"
+    "drivers/rapidio"
+    "drivers/auxdisplay"
+    "drivers/memstick"
+    "drivers/pcmcia"
+    "drivers/firewire"
+    "drivers/w1"
+    "drivers/most"
+    "drivers/greybus"
+    "drivers/slimbus"
+    "drivers/siox"
+    "drivers/macintosh"
+    "drivers/android"
+    "drivers/ssb"
+    "drivers/bcma"
+    "drivers/ipack"
+    "drivers/mcb"
+    "drivers/peci"
+    "drivers/hsi"
+    "drivers/accessibility"
+
+    # FS — екзотика
+    "fs/ocfs2"
+    "fs/ceph"
+    "fs/afs"
+    "fs/gfs2"
+    "fs/ubifs"
+    "fs/nilfs2"
+    "fs/jfs"
+    "fs/jffs2"
+    "fs/dlm"
+)
+for d in "${REMOVE_DIRS[@]}"; do
+    rm -rf "${KMOD_DIR:?}/$d"
+done
+chroot "$CHROOT" depmod -a "$KVER"
+
+# 2б. Очищення firmware (~701MB → ~20MB)
+echo "Pruning firmware..."
+FW_DIR="$CHROOT/lib/firmware"
+REMOVE_FW=(
+    amdgpu nvidia radeon i915 xe
+    # WiFi/Bluetooth
+    ath10k ath11k ath12k mediatek rtw89 rtw88 brcm cypress
+    ti-connectivity mrvl
+    # Рідкісне/непотрібне
+    netronome liquidio LENOVO
+)
+for d in "${REMOVE_FW[@]}"; do
+    rm -rf "${FW_DIR:?}/$d"
+done
+rm -rf "$FW_DIR"/iwlwifi-*
+
+# Intel — залишаємо тільки серверні NIC (ice, i40e, ixgbe, e1000)
+if [ -d "$FW_DIR/intel" ]; then
+    mkdir -p "$FW_DIR/intel-keep"
+    for nic_fw in ice iavf e100 e1000 e1000e; do
+        [ -d "$FW_DIR/intel/$nic_fw" ] && mv "$FW_DIR/intel/$nic_fw" "$FW_DIR/intel-keep/" 2>/dev/null || true
+    done
+    rm -rf "$FW_DIR/intel"
+    mv "$FW_DIR/intel-keep" "$FW_DIR/intel"
+fi
+
+# 2в. Додаткове очищення модулів ядра
+echo "Pruning extra kernel modules..."
+EXTRA_REMOVE_DIRS=(
+    "drivers/regulator"     # Embedded voltage regulators
+    "drivers/platform"      # Laptop/embedded platform drivers
+    "drivers/hwmon"         # Датчики температури/напруги
+    "drivers/mtd"           # Flash memory
+    "drivers/video"         # Framebuffer (є virtio/bochs в gpu/)
+)
+for d in "${EXTRA_REMOVE_DIRS[@]}"; do
+    rm -rf "${KMOD_DIR:?}/$d"
+done
+chroot "$CHROOT" depmod -a "$KVER"
+
+# 2г. Очищення usr/share (~107MB → ~5MB)
+echo "Cleaning usr/share..."
+rm -rf "$CHROOT/usr/share/doc"
+rm -rf "$CHROOT/usr/share/man"
+rm -rf "$CHROOT/usr/share/info"
+if [ -d "$CHROOT/usr/share/locale" ]; then
+    find "$CHROOT/usr/share/locale" -mindepth 1 -maxdepth 1 -type d \
+        ! -name 'en' ! -name 'en_US' ! -name 'uk' ! -name 'uk_UA' ! -name 'C' \
+        -exec rm -rf {} +
+fi

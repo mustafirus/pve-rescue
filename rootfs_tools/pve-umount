@@ -1,0 +1,21 @@
+#!/bin/bash
+set -e
+
+MNT="${1:-/mnt}"
+POOL="${2:-rpool}"
+
+echo "=== Unmounting PVE ==="
+
+# Розмонтовуємо в зворотньому порядку
+umount -l "$MNT/run"  2>/dev/null || true
+umount -l "$MNT/dev"  2>/dev/null || true
+umount -l "$MNT/sys"  2>/dev/null || true
+umount -l "$MNT/proc" 2>/dev/null || true
+
+# Розмонтовуємо ZFS
+zfs unmount -a 2>/dev/null || true
+
+# Експортуємо пул (чисте від'єднання)
+zpool export "$POOL" 2>/dev/null && echo "Pool '$POOL' exported" || echo "Warning: could not export '$POOL'"
+
+echo "✅ Done"

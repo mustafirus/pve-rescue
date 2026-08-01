@@ -1,0 +1,7 @@
+
+  ┌─────────────────────────────────────────┐
+  │         PVE RESCUE SYSTEM               │
+  │  Manual ZFS:      zpool import -a -f -N │
+  │  Manual LVM:      vgchange -ay          │
+  │  Chroot to PVE:   pve-chroot            │
+  └─────────────────────────────────────────┘

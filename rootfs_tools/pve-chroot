@@ -1,0 +1,80 @@
+#!/bin/bash
+set -e
+
+MNT="${1:-/mnt}"
+POOL="${2:-rpool}"
+
+echo "=== PVE Chroot Helper ==="
+
+# 1. Імпортуємо ZFS пул
+if ! zpool list "$POOL" &>/dev/null; then
+    echo "Importing ZFS pool '$POOL'..."
+    zpool import -f -N "$POOL" || {
+        echo "FATAL: cannot import pool '$POOL'"
+        echo "Available pools:"
+        zpool import 2>/dev/null | grep -E "pool:|id:" || echo "  (none found)"
+        echo ""
+        echo "Usage: pve-chroot [mountpoint] [poolname]"
+        exit 1
+    }
+fi
+
+# 2. Визначаємо root dataset
+# Proxmox стандартна структура: rpool/ROOT/pve-1
+ROOT_DS=""
+for ds in "$POOL/ROOT/pve-1" "$POOL/ROOT/pbs-1" "$POOL/ROOT/pve" "$POOL/ROOT"; do
+    if zfs list "$ds" &>/dev/null; then
+        ROOT_DS="$ds"
+        break
+    fi
+done
+
+if [ -z "$ROOT_DS" ]; then
+    echo "FATAL: cannot find root dataset in pool '$POOL'"
+    echo "Available datasets:"
+    zfs list -r "$POOL" -o name,mountpoint 2>/dev/null
+    exit 1
+fi
+
+echo "Root dataset: $ROOT_DS"
+
+# 3. Монтуємо root dataset
+mkdir -p "$MNT"
+zfs set mountpoint="$MNT" "$ROOT_DS"
+zfs mount "$ROOT_DS" || true
+
+# 4. Монтуємо інші datasets з цього пулу
+# (data, var-lib-vz, etc — з правильними mountpoint відносно $MNT)
+echo "Mounting child datasets..."
+zfs list -r "$POOL" -H -o name,mountpoint | while read -r ds mp; do
+    [ "$ds" = "$ROOT_DS" ] && continue
+    [ "$mp" = "none" ] || [ "$mp" = "-" ] || [ "$mp" = "legacy" ] && continue
+    # Пропускаємо datasets які не під / (swap, etc)
+    case "$mp" in
+        /*) ;;
+        *) continue ;;
+    esac
+    target="$MNT$mp"
+    mkdir -p "$target"
+    zfs set mountpoint="$target" "$ds" 2>/dev/null || true
+    zfs mount "$ds" 2>/dev/null || true
+done
+
+# 5. Bind-монтуємо системні FS
+echo "Mounting system filesystems..."
+mount -t proc     proc     "$MNT/proc"
+mount -t sysfs    sysfs    "$MNT/sys"
+mount --rbind     /dev     "$MNT/dev"
+mount --make-rslave        "$MNT/dev"
+mount --rbind     /run     "$MNT/run"
+mount --make-rslave        "$MNT/run"
+
+# 6. Resolv.conf
+cp -L /etc/resolv.conf "$MNT/etc/resolv.conf" 2>/dev/null || true
+
+echo ""
+echo "✅ Ready! Entering chroot at $MNT"
+echo "   Type 'exit' to leave chroot"
+echo ""
+
+chroot "$MNT" /bin/bash --login

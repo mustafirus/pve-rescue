@@ -1,0 +1,13 @@
+[Unit]
+Description=PVE Rescue Setup (SSH keys, motd)
+After=systemd-networkd.service
+Wants=systemd-networkd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/rescue-setup.sh
+StandardOutput=journal+console
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
